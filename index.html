@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glasoptik</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .ui { position: fixed; font-family: "Times New Roman", Georgia, serif; color: #eef2f8; user-select: none; }
+  #title { top: 18px; left: 22px; max-width: 42ch; }
+  #title h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  #title p { margin: 4px 0 0; font-size: 13px; color: #aab4c4; line-height: 1.45; }
+  #fps { top: 18px; right: 22px; font-size: 12px; color: #93a0b4; font-variant-numeric: tabular-nums; }
+  #panel { bottom: 18px; left: 22px; width: 224px; padding: 14px 16px;
+           background: rgba(14,18,26,.62); backdrop-filter: blur(8px);
+           border: 1px solid rgba(255,255,255,.1); border-radius: 10px; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; font-size: 13px; }
+  .row output { font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: #7fb4ff; }
+  input[type=color] { width: 36px; height: 20px; border: 0; background: none; padding: 0; cursor: pointer; }
+  #credit { bottom: 6px; left: 22px; font-size: 11px; color: #5e6880; }
+</style>
+</head>
+<body>
+<div id="title" class="ui">
+  <h1>Glasoptik</h1>
+  <p>Raymarchad gjutglasform i realtids-GLSL: brytning, kromatisk dispersion, fresnel och absorption. Dra för att rotera, scrolla för att zooma.</p>
+</div>
+<div id="fps" class="ui">-- fps</div>
+<div id="panel" class="ui">
+  <div class="row"><label for="ior">Brytningsindex</label><output id="iorV"></output></div>
+  <input id="ior" type="range" min="1.2" max="2" step=".01" value="1.5">
+  <div class="row"><label for="disp">Dispersion</label><output id="dispV"></output></div>
+  <input id="disp" type="range" min="0" max="1" step=".01" value=".6">
+  <div class="row"><label for="dens">Färgtäthet</label><output id="densV"></output></div>
+  <input id="dens" type="range" min="0" max="3" step=".01" value=".45">
+  <div class="row"><label for="col">Glasfärg</label><input id="col" type="color" value="#bfe6ff"></div>
+  <div class="row"><label for="qual">Kvalitet</label><output id="qualV"></output></div>
+  <input id="qual" type="range" min=".25" max="1" step=".05" value=".6">
+</div>
+<div id="credit" class="ui">Nadeschda Barenje, glasoptik i realtids-GLSL</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const canvas = document.body.appendChild(document.createElement('canvas'));
+const renderer = new THREE.WebGLRenderer({ canvas });
+renderer.setPixelRatio(1);
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const U = {
+  uResolution: { value: new THREE.Vector2() },
+  uTime:  { value: 0 },
+  uRot:   { value: new THREE.Vector2(0.5, 0.15) },
+  uDist:  { value: 3.6 },
+  uIOR:   { value: 1.5 },
+  uDisp:  { value: 0.6 },
+  uDens:  { value: 0.45 },
+  uColor: { value: new THREE.Color(0xbfe6ff) },
+};
+
+const frag = /* glsl */`
+precision highp float;
+uniform vec2 uResolution, uRot; uniform float uTime, uDist, uIOR, uDisp, uDens; uniform vec3 uColor;
+
+mat3 rotY(float a){ float c=cos(a),s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+mat3 rotX(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,-s, 0.,s,c); }
+float smin(float a,float b,float k){ float h=clamp(.5+.5*(b-a)/k,0.,1.); return mix(b,a,h)-k*h*(1.-h); }
+float sdBox(vec3 p,vec3 b,float r){ vec3 q=abs(p)-b; return length(max(q,0.))+min(max(q.x,max(q.y,q.z)),0.)-r; }
+
+// the cast-glass form, a bevelled block melted into a sphere, spinning slowly
+float glass(vec3 p){
+  p = rotX(.35) * rotY(uTime*.28) * p;
+  return smin(sdBox(p, vec3(.55), .14), length(p) - .92, .28);
+}
+vec3 normal(vec3 p){
+  vec2 e = vec2(.0012, 0.);
+  return normalize(vec3(glass(p+e.xyy)-glass(p-e.xyy),
+                        glass(p+e.yxy)-glass(p-e.yxy),
+                        glass(p+e.yyx)-glass(p-e.yyx)));
+}
+
+// what the reflected and refracted rays see: a graded sky over a studio floor
+vec3 sky(vec3 rd){
+  vec3 c = mix(vec3(.86,.91,.98), vec3(.30,.45,.72), pow(clamp(rd.y*.5+.5,0.,1.), .75));
+  float sun = pow(max(dot(rd, normalize(vec3(.55,.62,-.55))), 0.), 320.);
+  return c + vec3(1.,.96,.86) * sun * 2.;
+}
+vec3 env(vec3 ro, vec3 rd){
+  if(rd.y < -.0015){
+    float t = (-1.25 - ro.y) / rd.y; vec3 p = ro + rd*t;
+    float chk = step(.5, mod(floor(p.x*.5) + floor(p.z*.5), 2.));
+    vec3 floorCol = mix(vec3(.09,.10,.14), vec3(.72,.76,.82), chk);
+    return mix(sky(rd), floorCol, clamp(exp(-.015*t*t), 0., 1.));
+  }
+  return sky(rd);
+}
+
+// trace one wavelength in through the solid and out again, tinted by path length
+vec3 through(vec3 p, vec3 n, vec3 rd, float ior){
+  vec3 ri = refract(rd, n, 1./ior);
+  if(dot(ri, ri) < 1e-6) return env(p, reflect(rd, n));
+  vec3 q = p + ri*.03, ne = n;
+  for(int i=0;i<56;i++){ float d = glass(q); if(d > 0.){ ne = normal(q); break; } q += ri*max(-d, .012); }
+  vec3 exitRay = refract(ri, -ne, ior);
+  vec3 col = dot(exitRay, exitRay) < 1e-6 ? env(q, reflect(ri, ne)) : env(q, exitRay);
+  return col * exp(-uDens * length(q - p) * (vec3(1.) - uColor));
+}
+
+vec3 shade(vec3 ro, vec3 rd, vec3 p, vec3 n){
+  float f0 = pow((1. - uIOR) / (1. + uIOR), 2.);
+  float fres = f0 + (1. - f0) * pow(1. - clamp(dot(-rd, n), 0., 1.), 5.);
+  vec3 refl = env(p + n*.02, reflect(rd, n));
+  // one refraction per channel, with slightly different indices, gives dispersion
+  vec3 refr = vec3(through(p, n, rd, uIOR*(1. - .035*uDisp)).r,
+                   through(p, n, rd, uIOR).g,
+                   through(p, n, rd, uIOR*(1. + .035*uDisp)).b);
+  return mix(refr, refl, fres);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - .5*uResolution) / uResolution.y;
+  vec3 ro = rotY(uRot.x) * rotX(uRot.y) * vec3(0., 0., uDist);
+  vec3 fwd = normalize(-ro), right = normalize(cross(vec3(0.,1.,0.), fwd));
+  vec3 rd = normalize(uv.x*right + uv.y*cross(fwd, right) + 1.35*fwd);
+
+  float t = 0.; bool hit = false; vec3 p;
+  for(int i=0;i<96;i++){ p = ro + rd*t; float d = glass(p); if(d < .0008){ hit = true; break; } t += d; if(t > 9.) break; }
+
+  vec3 col = hit ? shade(ro, rd, p, normal(p)) : env(ro, rd);
+  col = pow(col / (col + .42), vec3(.4545));                 // tonemap + gamma
+  col *= mix(.82, 1., smoothstep(1.35, .3, length(uv)));     // vignette
+  gl_FragColor = vec4(col, 1.);
+}`;
+
+const mat = new THREE.ShaderMaterial({
+  uniforms: U,
+  vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0., 1.); }',
+  fragmentShader: frag,
+});
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
+
+let quality = 0.6;
+function resize(){
+  const w = Math.floor(innerWidth * quality), h = Math.floor(innerHeight * quality);
+  renderer.setSize(w, h, false);
+  U.uResolution.value.set(w, h);
+}
+addEventListener('resize', resize); resize();
+
+let drag = false, px, py;
+canvas.onpointerdown = e => { drag = true; px = e.clientX; py = e.clientY; };
+onpointerup = () => drag = false;
+onpointermove = e => {
+  if(!drag) return;
+  U.uRot.value.x += (e.clientX - px) * .006;
+  U.uRot.value.y = Math.max(-1.3, Math.min(1.3, U.uRot.value.y + (e.clientY - py) * .006));
+  px = e.clientX; py = e.clientY;
+};
+canvas.onwheel = e => { e.preventDefault(); U.uDist.value = Math.max(2.2, Math.min(6.5, U.uDist.value + e.deltaY * .002)); };
+
+const slider = (id, set) => {
+  const el = document.getElementById(id), out = document.getElementById(id + 'V');
+  const show = () => { set(parseFloat(el.value)); out.textContent = (+el.value).toFixed(2); };
+  el.oninput = show; show();
+};
+slider('ior',  v => U.uIOR.value = v);
+slider('disp', v => U.uDisp.value = v);
+slider('dens', v => U.uDens.value = v);
+slider('qual', v => { quality = v; resize(); });
+document.getElementById('col').oninput = e => U.uColor.value.set(e.target.value);
+
+const fps = document.getElementById('fps');
+let t0 = performance.now(), last = t0, frames = 0, acc = 0;
+(function loop(){
+  const now = performance.now();
+  U.uTime.value = (now - t0) / 1000;
+  renderer.render(scene, camera);
+  frames++; acc += now - last; last = now;
+  if(acc > 500){ fps.textContent = Math.round(frames * 1000 / acc) + ' fps'; frames = 0; acc = 0; }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
